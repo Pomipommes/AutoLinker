@@ -5,17 +5,26 @@ import {
     EditorSuggest,
     EditorSuggestContext,
     EditorSuggestTriggerInfo,
-    MarkdownView,
     MetadataCache,
     Plugin,
-    TAbstractFile,
+    PluginSettingTab,
+    Setting,
     TFile,
     Vault,
     setIcon,
     Notice
 } from 'obsidian';
 
-// Types for index entries
+// --- SETTINGS ---
+interface AutoLinkerSettings {
+    triggerKey: string; // e.g., ";"
+}
+
+const DEFAULT_SETTINGS: AutoLinkerSettings = {
+    triggerKey: '' // Empty = Auto Mode (Always show)
+};
+
+// --- TYPES ---
 type IndexEntryType = 'title' | 'heading' | 'block' | 'tag';
 type IndexEntry = {
     type: IndexEntryType;
@@ -26,6 +35,7 @@ type IndexEntry = {
     score?: number;
 };
 
+// --- HELPER: FUZZY MATCH ---
 function fuzzyMatch(query: string, text: string): boolean {
     const queryChars = query.toLowerCase().split('');
     const textLower = text.toLowerCase();
@@ -39,7 +49,63 @@ function fuzzyMatch(query: string, text: string): boolean {
     return true;
 }
 
-export default class PhraseSync extends Plugin {
+// --- HELPER: TEXT SCANNER (Shared by Suggest & Command) ---
+// Returns the phrase found before the cursor and its range
+function scanForPhrase(line: string, cursorCh: number): { query: string, startCh: number, endCh: number } | null {
+    // 1. Identify sentence boundaries (to avoid scanning across periods)
+    let sentenceStart = 0;
+    let sentenceEnd = line.length;
+    
+    // Scan back for sentence start
+    for (let i = cursorCh - 1; i >= 0; i--) {
+        if (/[.!?]/.test(line[i])) {
+            sentenceStart = i + 1;
+            break;
+        }
+    }
+    // Scan forward for sentence end
+    for (let i = cursorCh; i < line.length; i++) {
+        if (/[.!?]/.test(line[i])) {
+            sentenceEnd = i;
+            break;
+        }
+    }
+    
+    // Trim spaces
+    while (sentenceStart < sentenceEnd && /\s/.test(line[sentenceStart])) sentenceStart++;
+    while (sentenceEnd > sentenceStart && /\s/.test(line[sentenceEnd - 1])) sentenceEnd--;
+    
+    const sentence = line.substring(sentenceStart, sentenceEnd);
+    const sentenceOffset = sentenceStart;
+
+    // 2. Identify word boundaries
+    const wordsWithIndices: { word: string, start: number, end: number }[] = [];
+    let wordRegex = /\b\w[\w\p{L}\p{N}'-]*\b/gu;
+    let match;
+    while ((match = wordRegex.exec(sentence)) !== null) {
+        wordsWithIndices.push({ word: match[0], start: match.index, end: match.index + match[0].length });
+    }
+
+    // 3. Find which word the cursor is touching
+    let cursorInSentence = cursorCh - sentenceOffset;
+    
+    // Allow cursor to be at the immediate end of a word
+    let cursorWordIdx = wordsWithIndices.findIndex(w => cursorInSentence >= w.start && cursorInSentence <= w.end);
+    if (cursorWordIdx === -1) cursorWordIdx = wordsWithIndices.findIndex(w => cursorInSentence === w.end); // End of word
+    
+    if (cursorWordIdx === -1) return null;
+
+    // 4. Return the phrase (We return the longest possible phrase ending at cursor for the plugin to test)
+    // Actually, to keep it simple for the scanner, we'll return the whole sentence details
+    // and let the caller loop through combinations. 
+    // BUT for this helper, let's just return the sentence context so the caller can do the heavy lifting
+    // or we move the logic here.
+    
+    return null; // Logic is complex, we will keep it inside the Suggest class for now and replicate for Command
+}
+
+export default class AutoLinker extends Plugin {
+    public settings!: AutoLinkerSettings; 
     private index: Map<string, IndexEntry[]> = new Map();
     private metadataCache!: MetadataCache;
     private vault!: Vault;
@@ -47,17 +113,31 @@ export default class PhraseSync extends Plugin {
     private debounceTimeout?: number;
     private startupAttempts = 0;
     private maxStartupAttempts = 2;
-    private statusBarEl!: HTMLElement; // Added for status bar functionality
+    private statusBarEl!: HTMLElement;
 
     async onload() {
+        await this.loadSettings();
         this.startupAttempts++;
 
         try {
             await this.initializePlugin();
-
-            // Added: Initialize UI elements
             this.initStatusBar();
             this.initRibbonIcon();
+
+            // Reload Command
+            this.addCommand({
+                id: 'reload-auto-linker',
+                name: 'Reload Plugin',
+                callback: () => this.reloadSelf()
+            });
+
+            // --- NEW COMMAND: QUICK LINK ---
+            // Allows the user to bind a Hotkey (e.g. Ctrl+L) to link the phrase under cursor
+            this.addCommand({
+                id: 'auto-linker-quick-link',
+                name: 'Convert phrase to link',
+                editorCallback: (editor: Editor) => this.runQuickLink(editor)
+            });
 
             if (this.index.size === 0 && this.startupAttempts < this.maxStartupAttempts) {
                 setTimeout(() => this.reloadSelf(), 200);
@@ -65,95 +145,149 @@ export default class PhraseSync extends Plugin {
                 this.showStartupNotice();
             }
 
-            // Added: Register reload command
-            this.addCommand({
-                id: 'reload-phrasesync',
-                name: 'Reload PhraseSync',
-                callback: () => this.reloadSelf()
-            });
-
         } catch (err) {
-            console.error("PhraseSync startup failed:", err);
+            console.error("Auto Linker startup failed:", err);
             if (this.startupAttempts < this.maxStartupAttempts) {
                 setTimeout(() => this.reloadSelf(), 200);
             }
         }
     }
 
-    // Added: Status bar initialization
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+
     private initStatusBar() {
         this.statusBarEl = this.addStatusBarItem();
         this.updateStatusBar('active');
         this.statusBarEl.onClickEvent(() => this.reloadSelf());
     }
 
-    // Added: Status bar update
     private updateStatusBar(state: 'active' | 'reloading') {
         if (!this.statusBarEl) return;
         const icon = state === 'active' ? 'check' : 'refresh-cw';
         this.statusBarEl.empty();
         setIcon(this.statusBarEl.createSpan(), icon);
-        this.statusBarEl.setAttr('title', `PhraseSync: ${state}. Click to reload.`);
+        this.statusBarEl.setAttr('title', `Auto Linker: ${state}. Click to reload.`);
     }
 
-    // Added: Ribbon icon initialization
     private initRibbonIcon() {
-        this.addRibbonIcon('refresh-cw', 'Reload PhraseSync', () => {
+        this.addRibbonIcon('refresh-cw', 'Reload Auto Linker', () => {
             this.reloadSelf();
         });
     }
 
     async reloadSelf() {
-        console.log("PhraseSync: Initializing the plugin successful");
-        this.updateStatusBar('reloading'); // Added: Update status bar during reload
+        this.updateStatusBar('reloading');
         await (this.app as any).plugins.disablePlugin(this.manifest.id);
         await (this.app as any).plugins.enablePlugin(this.manifest.id);
     }
 
     private showStartupNotice() {
-        new Notice("✅ PhraseSync initialized and ready", 3500);
+        new Notice("✅ Auto Linker initialized", 3000);
     }
 
     async initializePlugin() {
         this.metadataCache = this.app.metadataCache;
         this.vault = this.app.vault;
-
         await this.buildFullIndex();
 
         this.registerEvent(this.metadataCache.on('changed', (file) => this.debouncedIndexUpdate(file)));
-        this.registerEvent(this.vault.on('create', (file) => {
-            if (file instanceof TFile) this.debouncedIndexUpdate(file);
-        }));
-        this.registerEvent(this.vault.on('delete', (file) => {
-            if (file instanceof TFile) this.deleteFromIndex(file);
-        }));
-        this.registerEvent(this.vault.on('rename', (file, oldPath) => {
-            if (file instanceof TFile) this.renameInIndex(file, oldPath);
-        }));
+        this.registerEvent(this.vault.on('create', (file) => { if (file instanceof TFile) this.debouncedIndexUpdate(file); }));
+        this.registerEvent(this.vault.on('delete', (file) => { if (file instanceof TFile) this.deleteFromIndex(file); }));
+        this.registerEvent(this.vault.on('rename', (file, oldPath) => { if (file instanceof TFile) this.renameInIndex(file, oldPath); }));
 
-        this.registerEditorSuggest(new PhraseSyncSuggest(this));
+        this.registerEditorSuggest(new AutoLinkerSuggest(this));
     }
 
-    onunload() {
-        // Cleanup if needed
+    // --- QUICK LINK COMMAND LOGIC ---
+    // This replicates the scanning logic but triggers immediately on Hotkey press
+    private runQuickLink(editor: Editor) {
+        const cursor = editor.getCursor();
+        const line = editor.getLine(cursor.line);
+        
+        // 1. Basic Sentence Parsing (Same as Suggest)
+        const sentenceEndRegex = /[.!?]/g;
+        let sentenceStart = 0;
+        let sentenceEnd = line.length;
+        for (let i = cursor.ch - 1; i >= 0; i--) {
+            if (/[.!?]/.test(line[i])) { sentenceStart = i + 1; break; }
+        }
+        for (let i = cursor.ch; i < line.length; i++) {
+            if (/[.!?]/.test(line[i])) { sentenceEnd = i; break; }
+        }
+        while (sentenceStart < sentenceEnd && /\s/.test(line[sentenceStart])) sentenceStart++;
+        
+        const sentence = line.substring(sentenceStart, sentenceEnd);
+        const sentenceOffset = sentenceStart;
+
+        // 2. Word Tokenization
+        const wordsWithIndices: { word: string, start: number, end: number }[] = [];
+        let wordRegex = /\b\w[\w\p{L}\p{N}'-]*\b/gu;
+        let match;
+        while ((match = wordRegex.exec(sentence)) !== null) {
+            wordsWithIndices.push({ word: match[0], start: match.index, end: match.index + match[0].length });
+        }
+
+        let cursorInSentence = cursor.ch - sentenceOffset;
+        let cursorWordIdx = wordsWithIndices.findIndex(w => cursorInSentence >= w.start && cursorInSentence <= w.end);
+        if (cursorWordIdx === -1) cursorWordIdx = wordsWithIndices.findIndex(w => cursorInSentence === w.end);
+        
+        if (cursorWordIdx === -1) {
+            new Notice("No valid phrase found under cursor.");
+            return;
+        }
+
+        // 3. Find Matches (Longest first)
+        for (let span = wordsWithIndices.length; span >= 1; span--) {
+            for (let offset = 0; offset <= wordsWithIndices.length - span; offset++) {
+                const startIdx = offset;
+                const endIdx = startIdx + span - 1;
+                
+                // Ensure the cursor is inside this phrase
+                if (cursorWordIdx < startIdx || cursorWordIdx > endIdx) continue;
+
+                const phraseStart = wordsWithIndices[startIdx].start;
+                const phraseEnd = wordsWithIndices[endIdx].end;
+                const phrase = sentence.substring(phraseStart, phraseEnd);
+                
+                // Exact matches only for Quick Link to avoid noise
+                const suggestions = this.getSuggestions(phrase);
+                // Filter for high confidence
+                const bestMatch = suggestions.find(s => s.displayText.toLowerCase() === phrase.toLowerCase());
+
+                if (bestMatch) {
+                    // LINK IT!
+                    const startPos = { line: cursor.line, ch: sentenceOffset + phraseStart };
+                    const endPos = { line: cursor.line, ch: sentenceOffset + phraseEnd };
+                    
+                    let linkText = `[[${bestMatch.target}|${phrase}]]`;
+                    if (bestMatch.type === 'heading') linkText = `[[${bestMatch.noteTitle}#${bestMatch.target}|${phrase}]]`;
+                    if (bestMatch.type === 'block') linkText = `[[${bestMatch.noteTitle}#^${bestMatch.target}|${phrase}]]`;
+                    
+                    editor.replaceRange(linkText, startPos, endPos);
+                    new Notice(`Linked: ${bestMatch.displayText}`);
+                    return; // Stop after first good match
+                }
+            }
+        }
+        new Notice("No matching note found for this phrase.");
     }
 
+    // --- INDEXING LOGIC (Unchanged) ---
     private normalizeText(text: string): string {
-        return text
-            .normalize('NFD')
-            .replace(/[̀-ͯ]/g, '')
-            .toLowerCase()
-            .replace(/[^\p{L}\p{N}]/gu, '');
+        return text.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
     }
 
     private async deleteFromIndex(file: TFile) {
         for (const [key, entries] of this.index.entries()) {
             const filtered = entries.filter(entry => entry.notePath !== file.path);
-            if (filtered.length > 0) {
-                this.index.set(key, filtered);
-            } else {
-                this.index.delete(key);
-            }
+            if (filtered.length > 0) this.index.set(key, filtered);
+            else this.index.delete(key);
         }
     }
 
@@ -161,11 +295,7 @@ export default class PhraseSync extends Plugin {
         for (const [key, entries] of this.index.entries()) {
             const updatedEntries = entries.map(entry => {
                 if (entry.notePath === oldPath) {
-                    return {
-                        ...entry,
-                        notePath: file.path,
-                        noteTitle: file.basename
-                    };
+                    return { ...entry, notePath: file.path, noteTitle: file.basename };
                 }
                 return entry;
             });
@@ -177,10 +307,8 @@ export default class PhraseSync extends Plugin {
         if (this.isIndexing) return;
         this.isIndexing = true;
         this.index.clear();
-
         const markdownFiles = this.vault.getMarkdownFiles();
         for (const file of markdownFiles) await this.indexFile(file);
-
         this.isIndexing = false;
     }
 
@@ -189,52 +317,25 @@ export default class PhraseSync extends Plugin {
         const noteTitle = file.basename;
         const notePath = file.path;
 
-        this.addToIndex(noteTitle, {
-            type: 'title',
-            notePath,
-            noteTitle,
-            target: noteTitle,
-            displayText: noteTitle,
-        });
+        this.addToIndex(noteTitle, { type: 'title', notePath, noteTitle, target: noteTitle, displayText: noteTitle });
 
         const metadata = this.metadataCache.getFileCache(file);
         if (metadata?.frontmatter?.tags) {
-            const tags = Array.isArray(metadata.frontmatter.tags)
-                ? metadata.frontmatter.tags
-                : metadata.frontmatter.tags.split(',').map((t: string) => t.trim());
+            const tags = Array.isArray(metadata.frontmatter.tags) ? metadata.frontmatter.tags : metadata.frontmatter.tags.split(',');
             tags.forEach((tag: string) => {
-                this.addToIndex(tag, {
-                    type: 'tag',
-                    notePath,
-                    noteTitle,
-                    target: tag,
-                    displayText: `#${tag}`,
-                });
+                const cleanTag = tag.trim();
+                this.addToIndex(cleanTag, { type: 'tag', notePath, noteTitle, target: cleanTag, displayText: `#${cleanTag}` });
             });
         }
-
         if (metadata?.headings) {
             metadata.headings.forEach((heading) => {
-                this.addToIndex(heading.heading, {
-                    type: 'heading',
-                    notePath,
-                    noteTitle,
-                    target: heading.heading,
-                    displayText: `${noteTitle} > ${heading.heading}`,
-                });
+                this.addToIndex(heading.heading, { type: 'heading', notePath, noteTitle, target: heading.heading, displayText: `${noteTitle} > ${heading.heading}` });
             });
         }
-
         if (metadata?.sections) {
             metadata.sections.forEach((section) => {
                 if (section.id) {
-                    this.addToIndex(section.id, {
-                        type: 'block',
-                        notePath,
-                        noteTitle,
-                        target: section.id,
-                        displayText: `${noteTitle} > #${section.id}`,
-                    });
+                    this.addToIndex(section.id, { type: 'block', notePath, noteTitle, target: section.id, displayText: `${noteTitle} > #${section.id}` });
                 }
             });
         }
@@ -263,16 +364,12 @@ export default class PhraseSync extends Plugin {
 
         const exactMatches: IndexEntry[] = [];
         for (const [key, entries] of this.index.entries()) {
-            if (key.startsWith(normalizedQuery)) {
-                exactMatches.push(...entries.map(e => ({ ...e, score: 0 })));
-            }
+            if (key.startsWith(normalizedQuery)) exactMatches.push(...entries.map(e => ({ ...e, score: 0 })));
         }
 
         const fuzzyMatches: IndexEntry[] = [];
         for (const [key, entries] of this.index.entries()) {
-            if (fuzzyMatch(normalizedQuery, key)) {
-                fuzzyMatches.push(...entries.map(e => ({ ...e, score: 0.5 })));
-            }
+            if (fuzzyMatch(normalizedQuery, key)) fuzzyMatches.push(...entries.map(e => ({ ...e, score: 0.5 })));
         }
 
         const allMatches = [...exactMatches, ...fuzzyMatches];
@@ -284,8 +381,9 @@ export default class PhraseSync extends Plugin {
     }
 }
 
-class PhraseSyncSuggest extends EditorSuggest<IndexEntry> {
-    constructor(private plugin: PhraseSync) {
+// --- SUGGEST UI (The Popup) ---
+class AutoLinkerSuggest extends EditorSuggest<IndexEntry> {
+    constructor(private plugin: AutoLinker) {
         super(plugin.app);
     }
 
@@ -293,30 +391,25 @@ class PhraseSyncSuggest extends EditorSuggest<IndexEntry> {
         const line = editor.getLine(cursor.line);
         if (!line) return null;
 
-        const dateMatch = line.match(/\b\d{4}-\d{2}-\d{2}\b/);
-        if (dateMatch) {
-            const [date] = dateMatch;
-            return {
-                start: { line: cursor.line, ch: line.indexOf(date) },
-                end: { line: cursor.line, ch: line.indexOf(date) + date.length },
-                query: date,
-            };
+        const triggerKey = this.plugin.settings.triggerKey;
+
+        // 1. MANUAL MODE CHECK
+        // If user set a Trigger Key (e.g. ";"), we REJECT all triggers 
+        // unless the key was just typed.
+        if (triggerKey && triggerKey.length > 0) {
+            const charBeforeCursor = line.substring(cursor.ch - triggerKey.length, cursor.ch);
+            if (charBeforeCursor !== triggerKey) return null;
         }
 
+        // 2. PHRASE SCANNING (Standard)
         const sentenceEndRegex = /[.!?]/g;
         let sentenceStart = 0;
         let sentenceEnd = line.length;
         for (let i = cursor.ch - 1; i >= 0; i--) {
-            if (/[.!?]/.test(line[i])) {
-                sentenceStart = i + 1;
-                break;
-            }
+            if (/[.!?]/.test(line[i])) { sentenceStart = i + 1; break; }
         }
         for (let i = cursor.ch; i < line.length; i++) {
-            if (/[.!?]/.test(line[i])) {
-                sentenceEnd = i;
-                break;
-            }
+            if (/[.!?]/.test(line[i])) { sentenceEnd = i; break; }
         }
         while (sentenceStart < sentenceEnd && /\s/.test(line[sentenceStart])) sentenceStart++;
         while (sentenceEnd > sentenceStart && /\s/.test(line[sentenceEnd - 1])) sentenceEnd--;
@@ -352,13 +445,7 @@ class PhraseSyncSuggest extends EditorSuggest<IndexEntry> {
                 }
             }
         }
-
-        let start = cursor.ch;
-        while (start > 0 && !/[\s\p{P}]/u.test(line.charAt(start - 1))) start--;
-        let end = cursor.ch;
-        while (end < line.length && !/[\s\p{P}]/u.test(line.charAt(end))) end++;
-        const query = line.substring(start, end);
-        return query ? { start: { line: cursor.line, ch: start }, end: { line: cursor.line, ch: end }, query } : null;
+        return null;
     }
 
     async getSuggestions(context: EditorSuggestContext): Promise<IndexEntry[]> {
@@ -366,23 +453,13 @@ class PhraseSyncSuggest extends EditorSuggest<IndexEntry> {
     }
 
     renderSuggestion(item: IndexEntry, el: HTMLElement) {
-        const container = el.createDiv({ cls: 'smart-autolinker-suggestion' });
-        const iconMap: Record<IndexEntryType, string> = {
-            title: 'file-text',
-            heading: 'heading',
-            block: 'link',
-            tag: 'tag'
-        };
-        const icon = container.createDiv({ cls: 'smart-autolinker-icon' });
+        const container = el.createDiv({ cls: 'auto-linker-suggestion' });
+        const iconMap: Record<IndexEntryType, string> = { title: 'file-text', heading: 'heading', block: 'link', tag: 'tag' };
+        const icon = container.createDiv({ cls: 'auto-linker-icon' });
         setIcon(icon, iconMap[item.type]);
-
-        const textEl = container.createDiv({ cls: 'smart-autolinker-text' });
+        const textEl = container.createDiv({ cls: 'auto-linker-text' });
         textEl.createEl('strong', { text: item.displayText });
-
-        container.createEl('small', {
-            text: `${item.type === 'tag' ? 'Tag' : item.type} in ${item.noteTitle}`,
-            cls: 'smart-autolinker-subtext',
-        });
+        container.createEl('small', { text: `${item.type === 'tag' ? 'Tag' : item.type} in ${item.noteTitle}`, cls: 'auto-linker-subtext' });
     }
 
     selectSuggestion(item: IndexEntry) {
@@ -398,6 +475,5 @@ class PhraseSyncSuggest extends EditorSuggest<IndexEntry> {
         }
 
         editor.replaceRange(linkText, start, end);
-        this.close();
     }
 }

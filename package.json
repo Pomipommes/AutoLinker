@@ -1,9 +1,9 @@
 {
-  "name": "phrasesync",
+  "name": "auto-linker",
   "version": "1.0.0",
   "description": "Auto-suggests internal links in Obsidian from note titles, headings, and block references.",
   "main": "main.js",
-  "author": "Digvijay S. Todiwal",
+  "author": "Moriggl Dominik & Garbin Matteo",
   "license": "MIT",
   "scripts": {
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",

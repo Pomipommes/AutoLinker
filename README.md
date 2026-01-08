@@ -1,6 +1,6 @@
-# 🧠 PhraseSync – Smart Auto-Linker for Obsidian
+# 🧠 Auto Linker – Smart Auto-Linker for Obsidian
 
-**PhraseSync** is an Obsidian plugin that automatically suggests internal links as you type, matching:
+**Auto Linker** is an Obsidian plugin that automatically suggests internal links as you type, matching:
 - Note **titles**
 - Note **headings** (`#`)
 - Block **references** (`^block-id`)
@@ -25,7 +25,7 @@ No special syntax or prefix needed — it works **mid-sentence**, recognizes **m
 ### Manual Installation
 
 1. Download the latest `main.js`, `manifest.json`, and `styles.css` from the [Releases](https://github.com/digvijay-s-todiwal/phrasesync/releases) page.
-2. Place them inside a folder named `phrasesync` in your Obsidian `.obsidian/plugins/` directory.
+2. Place them inside a folder named `auto-linker` in your Obsidian `.obsidian/plugins/` directory.
 3. Enable the plugin from Obsidian Settings → Community Plugins.
 
 ---
