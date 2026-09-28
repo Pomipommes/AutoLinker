@@ -26,7 +26,7 @@ interface AutoLinkerSettings {
     indexTags: boolean;
     indexHeadings: boolean;
     indexBlocks: boolean;
-    useTargetName: boolean; // NEW: Replaces typed text with the actual note name
+    useTargetName: boolean;
 }
 
 const DEFAULT_SETTINGS: AutoLinkerSettings = {
@@ -37,7 +37,7 @@ const DEFAULT_SETTINGS: AutoLinkerSettings = {
     indexTags: true,
     indexHeadings: true,
     indexBlocks: false,
-    useTargetName: true // Enabled by default
+    useTargetName: true 
 };
 
 // --- TYPES ---
@@ -370,10 +370,25 @@ class AutoLinkerSuggest extends EditorSuggest<MatchResult> {
         // Hack to override default keyboard behavior in Obsidian Suggests
         // @ts-ignore
         if (this.scope && this.scope.keys) {
-            // Remove the default 'Enter' key handler so Enter falls through to the editor (makes a new line)
+            // Safely remove the default 'Enter' key handlers
             // @ts-ignore
-            this.scope.keys = this.scope.keys.filter(k => k.key !== "Enter");
+            this.scope.keys = this.scope.keys.filter(k => k.key && k.key.toLowerCase() !== "enter");
         }
+
+        // Register our own Enter handler to close the suggestion and bubble the event
+        this.scope.register([], "Enter", (evt: KeyboardEvent) => {
+            // 1. Close the suggest so CodeMirror's suggestion extension stops intercepting keys
+            this.close();
+            // 2. Returning `true` tells Obsidian's hotkey manager not to call preventDefault(),
+            // allowing the event to fall through to CodeMirror (which inserts a newline naturally).
+            return true;
+        });
+
+        // Do the same for Shift+Enter (commonly tied to suggestions as well)
+        this.scope.register(["Shift"], "Enter", (evt: KeyboardEvent) => {
+            this.close();
+            return true;
+        });
 
         // Register Tab to perform the selection instead
         this.scope.register([], "Tab", (evt: KeyboardEvent) => {
@@ -463,7 +478,6 @@ class AutoLinkerSuggest extends EditorSuggest<MatchResult> {
         const { editor, start, end, query } = this.context;
         const item = suggestion.item;
 
-        // If the setting is true, override the alias with the exact target name!
         let alias = query;
         if (this.plugin.settings.useTargetName || this.plugin.settings.triggerKey) {
             alias = item.target;
