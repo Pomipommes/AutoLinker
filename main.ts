@@ -26,6 +26,7 @@ interface AutoLinkerSettings {
     indexTags: boolean;
     indexHeadings: boolean;
     indexBlocks: boolean;
+    indexAliases: boolean;
     useTargetName: boolean;
 }
 
@@ -37,17 +38,19 @@ const DEFAULT_SETTINGS: AutoLinkerSettings = {
     indexTags: true,
     indexHeadings: true,
     indexBlocks: false,
+    indexAliases: true,
     useTargetName: true 
 };
 
 // --- TYPES ---
-type IndexEntryType = 'title' | 'heading' | 'block' | 'tag';
+type IndexEntryType = 'title' | 'heading' | 'block' | 'tag' | 'alias';
 type IndexEntry = {
     type: IndexEntryType;
     notePath: string;
     noteTitle: string;
     target: string;
     displayText: string;
+    alias?: string;
 };
 
 interface MatchResult {
@@ -57,7 +60,7 @@ interface MatchResult {
 
 // --- MAIN PLUGIN CLASS ---
 export default class AutoLinker extends Plugin {
-    public settings!: AutoLinkerSettings;
+    declare settings: AutoLinkerSettings;
     public forceTrigger: boolean = false;
     
     private index: Map<string, IndexEntry[]> = new Map();
@@ -151,7 +154,7 @@ export default class AutoLinker extends Plugin {
     }
 
     private showStartupNotice() {
-        new Notice("✅ Auto Linker initialized", 3000);
+        new Notice("Auto Linker initialized", 3000);
     }
 
     async initializePlugin() {
@@ -283,12 +286,22 @@ export default class AutoLinker extends Plugin {
                 }
             });
         }
+        if (this.settings.indexAliases && metadata?.frontmatter?.aliases) {
+            const rawAliases = metadata.frontmatter.aliases;
+            const aliases: string[] = Array.isArray(rawAliases) ? rawAliases : String(rawAliases).split(',');
+            aliases
+                .map((alias) => String(alias).trim())
+                .filter((alias) => alias.length > 0)
+                .forEach((alias) => {
+                    this.addToIndex(alias, { type: 'alias', notePath, noteTitle, target: noteTitle, alias, displayText: alias });
+                });
+        }
     }
 
     private addToIndex(key: string, entry: IndexEntry) {
         const normalizedKey = this.normalizeText(key);
         const entries = this.index.get(normalizedKey) || [];
-        if (!entries.some(e => e.type === entry.type && e.notePath === entry.notePath && e.target === entry.target)) {
+        if (!entries.some(e => e.type === entry.type && e.notePath === entry.notePath && e.target === entry.target && e.alias === entry.alias)) {
             entries.push(entry);
         }
         this.index.set(normalizedKey, entries);
@@ -311,7 +324,7 @@ export default class AutoLinker extends Plugin {
 
         for (const entries of this.index.values()) {
             for (const entry of entries) {
-                const uniqueKey = `${entry.type}-${entry.notePath}-${entry.target}`;
+                const uniqueKey = `${entry.type}-${entry.notePath}-${entry.target}-${entry.alias ?? ''}`;
                 if (seen.has(uniqueKey)) continue;
 
                 let match: SearchResult | null = null;
@@ -445,7 +458,7 @@ class AutoLinkerSuggest extends EditorSuggest<MatchResult> {
         const { item, match } = suggestion;
         const container = el.createDiv({ cls: 'auto-linker-suggestion' });
         
-        const iconMap: Record<IndexEntryType, string> = { title: 'file-text', heading: 'heading', block: 'link', tag: 'tag' };
+        const iconMap: Record<IndexEntryType, string> = { title: 'file-text', heading: 'heading', block: 'link', tag: 'tag', alias: 'quote' };
         const icon = container.createDiv({ cls: 'auto-linker-icon' });
         setIcon(icon, iconMap[item.type]);
 
@@ -469,7 +482,11 @@ class AutoLinkerSuggest extends EditorSuggest<MatchResult> {
             titleEl.setText(item.displayText);
         }
 
-        const subText = item.type === 'tag' ? 'Tag' : `${item.type} in ${item.noteTitle}`;
+        const subText = item.type === 'tag'
+            ? 'Tag'
+            : item.type === 'alias'
+                ? `Alias for ${item.noteTitle}`
+                : `${item.type} in ${item.noteTitle}`;
         container.createEl('small', { text: subText, cls: 'auto-linker-subtext' });
     }
 
@@ -479,7 +496,9 @@ class AutoLinkerSuggest extends EditorSuggest<MatchResult> {
         const item = suggestion.item;
 
         let alias = query;
-        if (this.plugin.settings.useTargetName || this.plugin.settings.triggerKey) {
+        if (item.type === 'alias' && item.alias) {
+            alias = item.alias;
+        } else if (this.plugin.settings.useTargetName || this.plugin.settings.triggerKey) {
             alias = item.target;
         }
 
@@ -487,6 +506,7 @@ class AutoLinkerSuggest extends EditorSuggest<MatchResult> {
 
         switch (item.type) {
             case 'title': linkText = `[[${item.target}|${alias}]]`; break;
+            case 'alias': linkText = `[[${item.noteTitle}|${alias}]]`; break;
             case 'heading': linkText = `[[${item.noteTitle}#${item.target}|${alias}]]`; break;
             case 'block': linkText = `[[${item.noteTitle}#^${item.target}|${alias}]]`; break;
             case 'tag': linkText = `[[${item.target}|${alias}]]`; break;
@@ -600,6 +620,16 @@ class AutoLinkerSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.indexBlocks)
                 .onChange(async (value) => {
                     this.plugin.settings.indexBlocks = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Index Aliases')
+            .setDesc('Include frontmatter aliases in suggestions. Selecting an alias links to the note with the alias as display text, e.g. [[Long Note Name|Short Alias]].')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.indexAliases)
+                .onChange(async (value) => {
+                    this.plugin.settings.indexAliases = value;
                     await this.plugin.saveSettings();
                 }));
     }
